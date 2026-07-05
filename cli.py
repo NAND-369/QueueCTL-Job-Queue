@@ -193,6 +193,11 @@ def main():
     config_parser.add_argument("key", help="Configuration key (e.g., max-retries)")
     config_parser.add_argument("value", help="Value to assign to the key")
 
+    # 6. Worker Subparser
+    worker_parser = subparsers.add_parser("worker", help="Manage background workers")
+    worker_parser.add_argument("action", choices=["start"], help="Start the workers")
+    worker_parser.add_argument("--count", type=int, default=1, help="Number of concurrent workers to run")
+
     args = parser.parse_args()
 
     if args.command == "enqueue":
@@ -206,6 +211,24 @@ def main():
     elif args.command == "config":
         if args.action == "set":
             set_config(args.key, args.value)
+    elif args.command == "worker":
+        if args.action == "start":
+            from multiprocessing import Process
+            from worker import start_worker
+            
+            print(f"Starting {args.count} worker(s). Press Ctrl+C to stop gracefully.")
+            processes = []
+            
+            # Spawn multiple identical workers
+            for i in range(args.count):
+                p = Process(target=start_worker, args=(i + 1,))
+                p.start()
+                processes.append(p)
+                
+            # Wait for all of them to safely shut down if Ctrl+C is pressed
+            for p in processes:
+                p.join()        
+
 
 if __name__ == "__main__":
     main()

@@ -1,27 +1,40 @@
 import sqlite3
 import time
 import subprocess
+import signal
 from datetime import datetime, timedelta
 
 DB_FILE = "queue.db"
-BACKOFF_BASE = 2  # The 'base' value for our delay calculation
+BACKOFF_BASE = 2
 
-def start_worker():
-    print("Worker started! Monitoring queue for active or retryable jobs...")
+# This is our global kill-switch flag
+keep_running = True
+
+def handle_shutdown(signum, frame):
+    """Catches Ctrl+C and flips the switch instead of crashing."""
+    global keep_running
+    print("\n[Signal] Shutdown requested! Worker will exit after the current job finishes...")
+    keep_running = False
+
+def start_worker(worker_id=1):
+    global keep_running
     
-    while True:
+    # Tell Python to route Ctrl+C (SIGINT) to our custom function
+    signal.signal(signal.SIGINT, handle_shutdown)
+    
+    print(f"Worker {worker_id} started! Monitoring queue...")
+    
+    # Notice we changed 'while True:' to 'while keep_running:'
+    while keep_running:
         try:
             conn = sqlite3.connect(DB_FILE, timeout=10)
             conn.row_factory = sqlite3.Row 
             cursor = conn.cursor()
 
-            # Protect against race conditions
             cursor.execute("BEGIN IMMEDIATE")
 
-            # Get current time in ISO format
             now_str = datetime.utcnow().isoformat() + "Z"
 
-            # UPGRADED SELECT: Look for 'pending' jobs OR 'failed' jobs whose wait time has expired
             cursor.execute('''
                 SELECT * FROM jobs 
                 WHERE state = 'pending' OR (state = 'failed' AND run_after <= ?)
@@ -33,66 +46,53 @@ def start_worker():
 
             if not job:
                 conn.commit()
+                conn.close()
                 time.sleep(2)
-                continue
+                continue # Loop restarts, will break if keep_running is False
 
             job_id = job['id']
             command = job['command']
             current_attempts = job['attempts']
             max_retries = job['max_retries']
 
-            # Claim the job
             cursor.execute('''
                 UPDATE jobs SET state = 'processing', updated_at = ? WHERE id = ?
             ''', (now_str, job_id))
             conn.commit() 
             conn.close()
 
-            print(f"\n[Worker] Processing job '{job_id}' (Attempt {current_attempts + 1}/{max_retries + 1})")
+            print(f"\n[Worker {worker_id}] Processing '{job_id}' (Attempt {current_attempts + 1}/{max_retries + 1})")
             
-            # Run the command and capture its result
+            # The worker is executing! If Ctrl+C is pressed NOW, the script won't die. 
+            # It waits for this subprocess to finish, and breaks the loop on the next cycle!
             result = subprocess.run(command, shell=True)
             
-            # Get fresh timestamps for updating the result
             now = datetime.utcnow()
             now_str = now.isoformat() + "Z"
             
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
 
-            # CASE A: The command succeeded!
             if result.returncode == 0:
                 cursor.execute('''
                     UPDATE jobs SET state = 'completed', updated_at = ? WHERE id = ?
                 ''', (now_str, job_id))
-                print(f"[Worker] Job '{job_id}' completed successfully!")
-            
-            # CASE B: The command failed!
+                print(f"[Worker {worker_id}] Job '{job_id}' completed successfully!")
             else:
                 new_attempts = current_attempts + 1
-                print(f"[Worker] Command failed with exit code {result.returncode}")
-
-                # Check if we have run out of retries
                 if new_attempts > max_retries:
-                    # Move to DLQ by marking it 'dead'
                     cursor.execute('''
                         UPDATE jobs SET state = 'dead', attempts = ?, updated_at = ? WHERE id = ?
                     ''', (new_attempts, now_str, job_id))
-                    print(f"[ERROR] Job '{job_id}' exhausted all retries. Moved to DLQ.")
-                
+                    print(f"[Worker {worker_id}] Job '{job_id}' moved to DLQ.")
                 else:
-                    # Calculate exponential backoff delay: base ^ attempts
                     delay_seconds = BACKOFF_BASE ** new_attempts
-                    
-                    # Calculate exactly when this job is allowed to run again
                     run_after_time = now + timedelta(seconds=delay_seconds)
                     run_after_str = run_after_time.isoformat() + "Z"
-
                     cursor.execute('''
-                        UPDATE jobs SET state = 'failed', attempts = ?, run_after = ?, updated_at = ? 
-                        WHERE id = ?
+                        UPDATE jobs SET state = 'failed', attempts = ?, run_after = ?, updated_at = ? WHERE id = ?
                     ''', (new_attempts, run_after_str, now_str, job_id))
-                    print(f"[Worker] Job '{job_id}' failed. Scheduled to retry in {delay_seconds} seconds.")
+                    print(f"[Worker {worker_id}] Job '{job_id}' failed. Retry in {delay_seconds}s.")
 
             conn.commit()
             conn.close()
@@ -102,6 +102,5 @@ def start_worker():
         except Exception as e:
             print(f"An error occurred: {e}")
             time.sleep(2)
-
-if __name__ == "__main__":
-    start_worker()
+            
+    print(f"Worker {worker_id} has safely shut down.")
