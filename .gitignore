@@ -1,0 +1,10 @@
+# Databases
+queue.db
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Environments
+venv/
+.env
